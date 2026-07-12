@@ -1,0 +1,286 @@
+PEP: XXXX
+Title: Cross-Interpreter Object Sharing
+Author: Eric Snow <ericsnowcurrently@gmail.com>
+Status: Draft
+Type: Standards Track
+Created: 19-May-2026
+Python-Version: 3.16
+
+.. canonical-doc:: :mod:`concurrent.interpreters`
+
+
+Abstract
+========
+
+This PEP proposes to add a means for users to safely and efficiently
+share arbitrary objects (or at least their data) between multiple
+interpreters in the same process.  This would be an improvement over
+the basic and inefficient data sharing that currently exists.  The
+proposed solution involves three parts: add C-API, add a new
+``PyTypeObject`` slot, and add a new Python object special method.
+
+
+Motivation
+==========
+
+The main deficiency for people using multiple interpreters is with
+efficiency.  The main area of inefficiency is communication between
+interpreters and otherwise sharing data between them.  Improving
+efficiency there would have a meaningful impact on the usability
+of multiple interpreters.
+
+
+Specification
+=============
+
+concurrent.interpreters
+-----------------------
+
+We will add the following function to the
+:mod:`concurrent.interpreters` module:
+
+* ``as_shareable(obj) -> CrossInterpreterObjectData``
+  Convert the given object to raw cross-interpreter data.  Return an
+  object that wraps that data.  This gives users a chance to convert
+  the object before passing it to 
+
+We will also add a new class to :mod:`concurrent.interpreters`:
+``CrossInterpreterObjectData``.  Instances 
+
+Special Methods
+---------------
+
+object.__share__
+(object.__xidata__)
+(object.__xidata_wrap__)
+
+C-API
+-----
+
+int PyTypeObject.tp_share(obj, _PyXIData_t \*);
+
+data types::
+
+  typedef struct _xidata _PyXIData_t;
+  typedef PyObject *(*xid_newobjfunc)(_PyXIData_t *);
+  typedef void (*xid_freefunc)(void *);
+
+  #define _PyXIData_DATA(DATA) ((DATA)->data)
+  #define _PyXIData_OBJ(DATA) ((DATA)->obj)
+  #define _PyXIData_INTERPID(DATA) ((DATA)->interpid)
+
+  #define _PyXIData_SET_FREE(DATA, FUNC) \
+      do { \
+          (DATA)->free = (FUNC); \
+      } while (0)
+  #define _PyXIData_CHECK_FREE(DATA, FUNC) \
+      ((DATA)->free == (FUNC))
+
+  #define _PyXIData_SET_NEW_OBJECT(DATA, FUNC) \
+      do { \
+          (DATA)->new_object = (FUNC); \
+      } while (0)
+  #define _PyXIData_CHECK_NEW_OBJECT(DATA, FUNC) \
+      ((DATA)->new_object == (FUNC))
+
+  typedef int xidata_fallback_t;
+  #define _PyXIDATA_XIDATA_ONLY (0)
+  #define _PyXIDATA_FULL_FALLBACK (1)
+
+  typedef int (*xidatafunc)(PyThreadState *, PyObject *, _PyXIData_t *);
+  typedef int (*xidatafbfunc)(
+          PyThreadState *, PyObject *, xidata_fallback_t, _PyXIData_t *);
+  typedef struct {
+      xidatafunc basic;
+      xidatafbfunc fallback;
+  } _PyXIData_getdata_t;
+
+  typedef int (*xid_wrapfunc)(PyThreadState *, PyObject *,
+                              PyObject **, _PyXIData_unwrapper_t*);
+  typedef PyObject *(*xid_unwrapfunc)(PyThreadState *, void *, PyObject *);
+  typedef struct _xidata_unwrapper {
+      xid_unwrapfunc func;
+      void *data;
+      xid_freefunc free;
+  } _PyXIData_unwrapper_t;
+  typedef struct {
+      // The _PyXIData_t fields that are swapped out for an unwrapper:
+      void *data;
+      xid_newobjfunc new_object;
+      xid_freefunc free;
+  } _PyXIData_wrapped_orig_t;
+
+defining cross-interpreter data::
+
+  PyAPI_FUNC(_PyXIData_t *) _PyXIData_New(void);
+  PyAPI_FUNC(void) _PyXIData_Free(_PyXIData_t *data);
+  PyAPI_FUNC(void) _PyXIData_Init(
+          _PyXIData_t \*data,
+          PyInterpreterState \*interp, void \*shared, PyObject \*obj,
+          xid_newobjfunc new_object);
+  PyAPI_FUNC(int) _PyXIData_InitWithSize(
+          _PyXIData_t \*,
+          PyInterpreterState \*interp, const size_t, PyObject \*,
+          xid_newobjfunc);
+  PyAPI_FUNC(void) _PyXIData_Clear(PyInterpreterState \*, _PyXIData_t \*);
+
+getting cross-interpreter data::
+
+  PyAPI_FUNC(PyObject *) _PyXIData_GetNotShareableErrorType(PyThreadState *);
+  PyAPI_FUNC(void) _PyXIData_SetNotShareableError(PyThreadState *, const char *);
+  PyAPI_FUNC(void) _PyXIData_FormatNotShareableError(
+          PyThreadState *,
+          const char *,
+          ...);
+
+  PyAPI_FUNC(_PyXIData_getdata_t) _PyXIData_Lookup(
+          PyThreadState *,
+          PyObject *);
+  PyAPI_FUNC(int) _PyObject_CheckXIData(
+          PyThreadState *,
+          PyObject *);
+
+  PyAPI_FUNC(int) _PyObject_GetXIDataNoFallback(
+          PyThreadState *,
+          PyObject *,
+          _PyXIData_t *);
+  PyAPI_FUNC(int) _PyObject_GetXIData(
+          PyThreadState *,
+          PyObject *,
+          xidata_fallback_t,
+          _PyXIData_t *);
+
+.. XXX bytes, code, function, marshal, pickle?
+
+using cross-interpreter data::
+
+  PyAPI_FUNC(PyObject *) _PyXIData_NewObject(_PyXIData_t *);
+  PyAPI_FUNC(int) _PyXIData_Release(_PyXIData_t *);
+  PyAPI_FUNC(int) _PyXIData_ReleaseAndRawFree(_PyXIData_t *);
+
+wrapping cross-interpreter data::
+
+  PyAPI_FUNC(int) _PyObject_GetXIDataWrapped(
+          PyThreadState *tstate,
+          PyObject *,
+          xid_wrapfunc,
+          _PyXIData_t *);
+  PyAPI_FUNC(int) _PyObject_GetXIDataWrappedWithObj(
+          PyThreadState *tstate,
+          PyObject *,
+          PyObject *,  // wrap(obj) -> (C-shareable obj, unwrap)
+          _PyXIData_t *);
+
+un-wrapping cross-interpreter data::
+
+  PyAPI_FUNC(int) _PyXIData_SetUnwrapper(
+          PyThreadState *,
+          _PyXIData_t *,
+          _PyXIData_unwrapper_t *);
+  PyAPI_FUNC(_PyXIData_unwrapper_t *) _PyXIData_GetUnwrapper(
+          _PyXIData_t *,
+          _PyXIData_wrapped_orig_t *);
+
+XIData wrapper objects::
+
+  PyAPI_DATA(PyTypeObject) _PyXIDataWrapper_Type;
+
+  PyAPI_FUNC(int) _PyXIDataWrapper_Check(PyObject *);
+  PyAPI_FUNC(int) _PyXIDataWrapper_CheckExact(PyObject *);
+
+  PyAPI_FUNC(PyObject *) _PyXIDataWrapper_New(
+          PyThreadState *,
+          PyObject *);
+  PyAPI_FUNC(PyObject *) _PyXIDataWrapper_NewWithoutFallback(
+          PyThreadState *,
+          PyObject *);
+  PyAPI_FUNC(PyObject *) _PyXIDataWrapper_FromWrapFunc(
+          PyThreadState *,
+          PyObject *,
+          xid_wrapfunc);
+  PyAPI_FUNC(PyObject *) _PyXIDataWrapper_FromWrapObj(
+          PyThreadState *,
+          PyObject *,
+          PyObject *);  // same as _PyObject_GetXIDataWrappedWithObj()
+  PyAPI_FUNC(PyObject *) _PyXIDataWrapper_FromData(
+          PyThreadState *,
+          _PyXIData_t *);
+
+Examples
+--------
+
+...
+
+
+Rationale
+=========
+
+...
+
+People have already been using the internal C-API and have asked for
+a public API.
+
+...
+
+
+Rejected Ideas
+==============
+
+...
+
+
+Copyright
+=========
+
+This document is placed in the public domain or under the
+CC0-1.0-Universal license, whichever is more permissive.
+
+
+PyAPI_FUNC(_PyXIData_t *) _PyXIData_New(void);
+PyAPI_FUNC(void) _PyXIData_Free(_PyXIData_t *data);
+PyAPI_FUNC(void) _PyXIData_Init(
+PyAPI_FUNC(int) _PyXIData_InitWithSize(
+PyAPI_FUNC(void) _PyXIData_Clear(PyInterpreterState *, _PyXIData_t *);
+PyAPI_FUNC(PyObject *) _PyXIData_GetNotShareableErrorType(PyThreadState *);
+PyAPI_FUNC(void) _PyXIData_SetNotShareableError(PyThreadState *, const char *);
+PyAPI_FUNC(void) _PyXIData_FormatNotShareableError(
+PyAPI_FUNC(_PyXIData_getdata_t) _PyXIData_Lookup(
+PyAPI_FUNC(int) _PyObject_CheckXIData(
+PyAPI_FUNC(int) _PyObject_GetXIDataNoFallback(
+PyAPI_FUNC(int) _PyObject_GetXIData(
+PyAPI_FUNC(PyObject *) _PyXIData_NewObject(_PyXIData_t *);
+PyAPI_FUNC(int) _PyXIData_Release(_PyXIData_t *);
+PyAPI_FUNC(int) _PyXIData_ReleaseAndRawFree(_PyXIData_t *);
+
+PyAPI_FUNC(int) _PyObject_GetXIDataWrapped(
+PyAPI_FUNC(int) _PyObject_GetXIDataWrappedWithObj(
+PyAPI_FUNC(int) _PyXIData_SetUnwrapper(
+PyAPI_FUNC(_PyXIData_unwrapper_t *) _PyXIData_GetUnwrapper(
+//PyAPI_FUNC(int) _PyXIData_UnwrapperFromObj(
+PyAPI_DATA(PyTypeObject) _PyXIDataWrapper_Type;
+PyAPI_FUNC(int) _PyXIDataWrapper_Check(PyObject *);
+PyAPI_FUNC(int) _PyXIDataWrapper_CheckExact(PyObject *);
+PyAPI_FUNC(PyObject *) _PyXIDataWrapper_New(
+PyAPI_FUNC(PyObject *) _PyXIDataWrapper_NewWithoutFallback(
+PyAPI_FUNC(PyObject *) _PyXIDataWrapper_FromWrapFunc(
+PyAPI_FUNC(PyObject *) _PyXIDataWrapper_FromWrapObj(
+PyAPI_FUNC(PyObject *) _PyXIDataWrapper_FromData(
+
+PyAPI_FUNC(int) _PyXI_UnwrapNotShareableError(
+
+
+PyAPI_FUNC(int) _PyBytes_GetData(PyObject *, _PyBytes_data_t *);
+PyAPI_FUNC(PyObject *) _PyBytes_FromData(_PyBytes_data_t *);
+PyAPI_FUNC(PyObject *) _PyBytes_FromXIData(_PyXIData_t *);
+PyAPI_FUNC(int) _PyBytes_GetXIData(
+PyAPI_FUNC(_PyBytes_data_t *) _PyBytes_GetXIDataWrapped(
+PyAPI_DATA(PyObject *) _PyPickle_LoadFromXIData(_PyXIData_t *);
+PyAPI_FUNC(int) _PyPickle_GetXIData(
+PyAPI_FUNC(PyObject *) _PyMarshal_ReadObjectFromXIData(_PyXIData_t *);
+PyAPI_FUNC(int) _PyMarshal_GetXIData(
+PyAPI_FUNC(PyObject *) _PyCode_FromXIData(_PyXIData_t *);
+PyAPI_FUNC(int) _PyCode_GetXIData(
+PyAPI_FUNC(int) _PyCode_GetScriptXIData(
+PyAPI_FUNC(int) _PyCode_GetPureScriptXIData(
+PyAPI_FUNC(PyObject *) _PyFunction_FromXIData(_PyXIData_t *);
+PyAPI_FUNC(int) _PyFunction_GetXIData(
